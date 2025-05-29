@@ -13,8 +13,8 @@ from fit import *
 from sklearn.model_selection import train_test_split
 
 
-skimfit = pickle.load(open('skimfit_bmi_snp.pkl', 'rb'))
-bmi_snp_fit_data = pickle.load(open('bmi_snp_fit_data.pkl', 'rb'))
+skimfit =df = pd.read_pickle("skimfit_bmi_snp.pkl")
+bmi_snp_fit_data = pd.read_pickle("bmi_snp_fit_data.pkl")
 
 data = bmi_snp_fit_data['data']
 X_valid = bmi_snp_fit_data['X_valid']
