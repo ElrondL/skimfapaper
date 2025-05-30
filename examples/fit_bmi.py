@@ -8,7 +8,7 @@ import math
 import pandas as pd
 import numpy as np
 from skimfa.kernels import PairwiseSKIMFABasisKernel
-from feature_maps import LinearFeatureMap
+from feature_maps import LinearFeatureMap, NonlinearFeatureMap
 from fit import *
 from sklearn.model_selection import train_test_split
 
@@ -34,16 +34,16 @@ avg_Y = Y.mean()
 # Convert to torch tensors / center response and covariates
 Y = torch.FloatTensor((Y - avg_Y)) # Demean response
 X = data.drop(['BMI', 'sample_id'], axis=1).values.copy()
-X = (X - X.mean(axis=0)) / X.std(axis=0)
+#X = (X - X.mean(axis=0)) / X.std(axis=0)
 X = torch.FloatTensor(X)
 
 X_train, X_valid, Y_train, Y_valid = train_test_split(X, Y, test_size=.15, random_state=seed)
 
 # Set hyperparams
-p = X_train.shape[0]
+p = X_train.shape[1]
 covariate_dims = list(range(p))
 covariate_types = ['continuous'] * p # irrelevant for now (in the future the selected feature map will depend on the covariate type)
-linfeatmap = LinearFeatureMap(covariate_dims, covariate_types)
+linfeatmap = NonlinearFeatureMap(covariate_dims, covariate_types)
 linfeatmap.make_feature_map(X_train) 
 
 # Step 2: Make kernel configuration

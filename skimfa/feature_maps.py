@@ -56,10 +56,11 @@ class NonlinearFeatureMap(FeatureMap):
         self.n_knots = n_knots
         self.n_wavelets = n_wavelets
         self.feature_processors = {}
+
         
     def make_feature_map(self, X_train):
         self.X_train = X_train
-        
+        self.input_dim_indcs = list(range(X_train.shape[1]))
         for i, (dim, cov_type) in enumerate(zip(self.covariate_dims, self.covariate_types)):
             if cov_type == 'categorical':
                 self._fit_categorical(X_train[:, i], i)
@@ -224,6 +225,11 @@ class NonlinearFeatureMap(FeatureMap):
             return self._transform_seasonal(x1d, processor)
         else:
             return x1d.reshape(-1, 1)
+        
+        ### need to add one with cut off frequency
+        
+    def get_feature_processors(self):
+        return self.feature_processors
 
 class AutoFeatureMap(FeatureMap):
     """Automatically choose between linear and nonlinear based on covariate types"""
