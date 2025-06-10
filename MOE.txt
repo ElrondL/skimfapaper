@@ -342,6 +342,74 @@ def predict_new_data(experts_or_model, X_new, special_feature_new=None):
         # Use standard model
         return experts_or_model.predict(X_new)
 
+
+def predict_with_experts(experts, X, special_feature):
+    """
+    Make predictions using appropriate expert for each sample based on special feature
+    
+    Args:
+        experts (dict): Dictionary of expert models, keyed by label
+        X (np.array): Input data of shape (n_samples, ...)
+        special_feature (np.array): Array of labels indicating which expert to use for each sample
+    
+    Returns:
+        np.array: Predictions with same shape as would be output by a single model
+    """
+    if len(X) == 0:
+        return np.array([])
+    
+    # Get output shape by making a prediction with first expert
+    first_expert = list(experts.values())[0]
+    sample_pred = first_expert.predict(X[:1])
+    output_shape = sample_pred.shape[1:]
+    
+    # Initialize predictions array
+    predictions = np.zeros((len(X),) + output_shape)
+    
+    # Get predictions from appropriate expert for each sample
+    unique_labels = np.unique(special_feature)
+    
+    for label in unique_labels:
+        if label in experts:
+            # Get indices for this expert
+            mask = special_feature == label
+            if np.any(mask):
+                # Get data for this expert
+                X_subset = X[mask]
+                # Get predictions from appropriate expert
+                pred_subset = experts[label].predict(X_subset)
+                # Store predictions in correct positions
+                predictions[mask] = pred_subset
+        else:
+            print(f"Warning: No expert found for label {label}")
+    
+    return predictions
+
+
+def evaluate_experts(experts, X, Y, special_feature):
+    """
+    Evaluate expert ensemble by computing loss across all samples
+    
+    Args:
+        experts (dict): Dictionary of expert models
+        X (np.array): Input data
+        Y (np.array): True targets
+        special_feature (np.array): Labels for routing to experts
+    
+    Returns:
+        float: Mean squared error loss
+    """
+    if len(X) == 0:
+        return 0.0
+    
+    # Get predictions
+    predictions = predict_with_experts(experts, X, special_feature)
+    
+    # Compute MSE loss
+    mse_loss = np.mean((predictions - Y) ** 2)
+    
+    return mse_loss
+
 # Usage example:
 """
 # Example usage with known labels at inference time
