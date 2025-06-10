@@ -1,0 +1,336 @@
+#============================================================================
+import tensorflow as tf
+import numpy as np
+import pandas as pd
+from itertools import product
+import itertools
+import matplotlib.pyplot as plt
+import time
+import os
+
+def create_expert_network(input_shape, output_shape, expert_id,
+                         activ, n_hl, n_ch, n_k, n_fc, dropout,
+                         seed=229, learning_rate=0.001, bias_constraint=True):
+    """
+    Create a single expert network for MoE
+    """
+    # Adjust seed for each expert to ensure different initializations
+    expert_seed = seed + expert_id * 100
+    
+    # Define the input placeholder
+    X_input = tf.keras.Input(shape=input_shape)
+    
+    # Create expert network using your existing function
+    X = create_supervised_X(X_input, output_shape=output_shape,
+                           activ=activ, n_hl=n_hl, n_ch=n_ch, n_k=n_k, 
+                           n_fc=n_fc, dropout=dropout,
+                           seed=expert_seed, bias_constraint=bias_constraint)
+    
+    expert = tf.keras.Model(inputs=X_input, outputs=X, name=f'Expert_{expert_id}')
+    
+    # Optimization
+    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, beta_1=0.9, beta_2=0.999, 
+                                  epsilon=None, decay=0.0, amsgrad=True)
+    
+    # Compilation
+    expert.compile(optimizer=opt, loss="mean_squared_error")
+    return expert
+
+def create_moe_model(input_shape, output_shape, num_experts, 
+                    activ, n_hl, n_ch, n_k, n_fc, dropout,
+                    seed=229, learning_rate=0.001, bias_constraint=True):
+    """
+    Create Mixture of Experts model with gating network
+    """
+    # Input layer
+    X_input = tf.keras.Input(shape=input_shape)
+    
+    # Create multiple expert networks
+    expert_outputs = []
+    experts = []
+    
+    for i in range(num_experts):
+        expert = create_expert_network(input_shape, output_shape, i,
+                                     activ, n_hl, n_ch, n_k, n_fc, dropout,
+                                     seed, learning_rate, bias_constraint)
+        expert_output = expert(X_input)
+        expert_outputs.append(expert_output)
+        experts.append(expert)
+    
+    # Simple gating network (you might want to make this more sophisticated)
+    # For now, this creates a simple dense layer that outputs probabilities for each expert
+    gate_layer = tf.keras.layers.Flatten()(X_input)
+    gate_layer = tf.keras.layers.Dense(64, activation='relu')(gate_layer)
+    gate_probs = tf.keras.layers.Dense(num_experts, activation='softmax', name='gate')(gate_layer)
+    
+    # Combine expert outputs using gating probabilities
+    # Stack expert outputs: [batch_size, output_shape, num_experts]
+    stacked_outputs = tf.stack(expert_outputs, axis=-1)
+    
+    # Expand gate probabilities to match output dimensions
+    gate_probs_expanded = tf.expand_dims(gate_probs, axis=1)  # [batch_size, 1, num_experts]
+    
+    # Weighted combination of expert outputs
+    final_output = tf.reduce_sum(stacked_outputs * gate_probs_expanded, axis=-1)
+    
+    # Create the full MoE model
+    moe_model = tf.keras.Model(inputs=X_input, outputs=final_output, name='MoE_ConvNet')
+    
+    # Compilation
+    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, beta_1=0.9, beta_2=0.999, 
+                                  epsilon=None, decay=0.0, amsgrad=True)
+    moe_model.compile(optimizer=opt, loss="mean_squared_error")
+    
+    return moe_model, experts
+
+def train_expert_individually(expert, X_expert, Y_expert, X_val_expert, Y_val_expert,
+                            epochs, batch_size, expert_id, OUTFOLDER):
+    """
+    Train individual expert on its subset of data
+    """
+    print(f"Training Expert {expert_id}")
+    
+    history = expert.fit(X_expert, Y_expert,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        validation_data=(X_val_expert, Y_val_expert),
+                        verbose=1)
+    
+    # Plot and save history
+    plt.figure(figsize=(8, 6))
+    plt.plot(np.sqrt(history.history['loss']))
+    plt.plot(np.sqrt(history.history['val_loss']))
+    plt.title(f'Expert {expert_id} Loss')
+    plt.ylabel('loss')
+    plt.xlabel('epoch')
+    plt.legend(['train', 'val'], loc='upper left')
+    plt.savefig(f'{OUTFOLDER}expert_{expert_id}_history.png')
+    plt.close()
+    
+    return history
+
+def train_model_moe(OUTFOLDER, 
+                   X_train, Y_train, special_feature_train,
+                   X_val, Y_val, special_feature_val,
+                   X_test, Y_test, special_feature_test,
+                   config,
+                   label, generate_s, use_moe=True):
+    """
+    Train Mixture of Experts model or fallback to original ConvNet
+    """
+    
+    if generate_s:
+        # Set-up
+        os.environ['PYTHONHASHSEED'] = '0'
+        tf.keras.backend.clear_session()
+                
+        # Define model shapes
+        hyp = interpretConfig(config)
+        activ, n_hl, n_ch, n_k, n_fc, dropout, batch_size, epochs, seed = hyp
+        np.random.seed(seed)
+        X_shape = X_train.shape[1:]
+        output_shape = Y_train.shape[-1]
+        
+        # Check if special feature exists and use_moe is True
+        if special_feature_train is not None and use_moe:
+            print("Training Mixture of Experts model")
+            
+            # Get unique labels in special feature
+            unique_labels = np.unique(special_feature_train)
+            num_experts = len(unique_labels)
+            print(f"Number of experts: {num_experts}")
+            print(f"Expert labels: {unique_labels}")
+            
+            # Create MoE model
+            moe_model, experts = create_moe_model(X_shape, output_shape, num_experts,
+                                                 activ, n_hl, n_ch, n_k, n_fc, dropout, seed)
+            
+            # Train each expert individually on its subset
+            for i, expert_label in enumerate(unique_labels):
+                # Get data for this expert
+                train_mask = special_feature_train == expert_label
+                val_mask = special_feature_val == expert_label
+                
+                X_expert = X_train[train_mask]
+                Y_expert = Y_train[train_mask]
+                X_val_expert = X_val[val_mask]
+                Y_val_expert = Y_val[val_mask]
+                
+                print(f"Expert {i} (label {expert_label}): {len(X_expert)} training samples, {len(X_val_expert)} validation samples")
+                
+                # Train individual expert
+                if len(X_expert) > 0:  # Only train if we have data
+                    train_expert_individually(experts[i], X_expert, Y_expert, 
+                                            X_val_expert, Y_val_expert,
+                                            epochs, batch_size, i, OUTFOLDER)
+            
+            # Now train the full MoE model (fine-tuning with gating)
+            print("Fine-tuning full MoE model with gating network")
+            history = moe_model.fit(X_train, Y_train,
+                                   epochs=epochs//2,  # Use fewer epochs for fine-tuning
+                                   batch_size=batch_size,
+                                   validation_data=(X_val, Y_val),
+                                   verbose=1)
+            
+            model = moe_model
+            
+        else:
+            print("Training standard ConvNet (no special feature or MoE disabled)")
+            # Create standard supervised model (your original approach)
+            model = create_supervised(X_shape, output_shape, 
+                                    activ, n_hl, n_ch, n_fc, n_k, dropout, seed=seed)
+            
+            # Fit model
+            history = model.fit(X_train, Y_train,
+                               epochs=epochs,
+                               batch_size=batch_size,
+                               validation_data=(X_val, Y_val),
+                               verbose=1)
+
+        # Report model summary
+        model.summary()
+        
+        # Plot history loss
+        plt.figure(figsize=(8, 6))
+        plt.plot(np.sqrt(history.history['loss']))
+        plt.plot(np.sqrt(history.history['val_loss']))
+        plt.title('Model Loss')
+        plt.ylabel('loss')
+        plt.xlabel('epoch')
+        plt.legend(['train', 'val'], loc='upper left')
+        plt.savefig(OUTFOLDER + 'history' + '_model_' + str(label) + '.png')
+        plt.close()
+
+        # Save model
+        model_json = model.to_json()
+        with open(OUTFOLDER + 'model_' + str(label) + '.json', "w") as json_file:
+            json_file.write(model_json)
+        model.save_weights(OUTFOLDER + 'model_' + str(label) + '.h5')
+        print("Saved model to disk")
+
+    else:
+        # Load model
+        with open(OUTFOLDER + 'model_' + str(label) + '.json', "r") as json_file:
+            loaded_model_json = json_file.read()
+        model = tf.keras.models.model_from_json(loaded_model_json)
+        model.load_weights(OUTFOLDER + 'model_' + str(label) + '.h5')
+        print("Loaded model from disk")
+
+        # Report model summary
+        model.summary()
+
+        # Compilation
+        model.compile(optimizer='Adam', loss="mean_squared_error") 
+
+    # Evaluate model       
+    loss_Tr = model.evaluate(x=X_train, y=Y_train)
+    loss_Va = model.evaluate(x=X_val, y=Y_val)
+    loss_Ts = model.evaluate(x=X_test, y=Y_test)
+    
+    # Target predictions
+    y_hat_train = model.predict(x=X_train)
+    y_hat_val = model.predict(x=X_val)
+    y_hat_test = model.predict(x=X_test)
+    
+    return loss_Tr, loss_Va, loss_Ts, y_hat_train, y_hat_val, y_hat_test
+
+def grid_search_moe(MODEL_PATH,
+                   X_train, Y_train, special_feature_train,
+                   X_val, Y_val, special_feature_val,
+                   X_test, Y_test, special_feature_test,
+                   hyp, n_runs, varInput, 
+                   generate_s=True, use_moe=True):
+    """
+    Grid search for MoE model
+    """
+    # Set-up
+    log_Y_hat_train, log_Y_hat_val, log_Y_hat_test, log_loss_val, log_label = [], [], [], [], []
+    
+    df = pd.DataFrame()
+    keys, values = zip(*hyp.items())
+
+    for ii, bundle in enumerate(product(*values)):        # Varying architectures
+        
+        config = dict(zip(keys, bundle))                  # Architecture
+        df_k = pd.DataFrame(config, index=[0])
+        
+        for jj in range(n_runs):                          # Check reproducibility - n runs                     
+            
+            # Simulation label
+            moe_suffix = "_moe" if use_moe and special_feature_train is not None else "_standard"
+            label = varInput + '_h_' + str(ii) + '_run_' + str(jj) + moe_suffix
+            print('')
+            print('Simulation:', label)
+
+            # Train NN model
+            time_start = time.time()
+            loss_Tr, loss_Va, loss_Ts,\
+            Y_hat_train, Y_hat_val, Y_hat_test = \
+            train_model_moe(MODEL_PATH, 
+                           X_train, Y_train, special_feature_train,
+                           X_val, Y_val, special_feature_val,
+                           X_test, Y_test, special_feature_test,
+                           config,
+                           label, generate_s=generate_s, use_moe=use_moe)
+
+            # Store results
+            log_Y_hat_train.append(Y_hat_train)
+            log_Y_hat_val.append(Y_hat_val)
+            log_Y_hat_test.append(Y_hat_test)
+            log_loss_val.append(loss_Va)
+            log_label.append(label)
+
+            # Compute evaluation metrics
+            df_k['run'] = jj
+            df_k['input'] = varInput
+            df_k['model_type'] = 'MoE' if use_moe and special_feature_train is not None else 'Standard'
+            df_k['RMSE-Ts'] = np.round(np.sqrt(np.mean((Y_hat_test - Y_test)**2)), 3)
+            df_k['RMSE-Tr'] = np.round(np.sqrt(np.mean((Y_hat_train - Y_train)**2)), 3)
+            df_k['RMSE-Va'] = np.round(np.sqrt(np.mean((Y_hat_val - Y_val)**2)), 3)
+            df_k['Time[min]'] = np.round((time.time()-time_start)/60, 2)            
+            df = df.append(df_k)
+            print('')
+            print(df.to_string())
+
+            # Write solutions to file
+            suffix = "_MoE" if use_moe and special_feature_train is not None else "_Standard"
+            df.to_csv(MODEL_PATH + 'Training_' + varInput + suffix + '.csv')
+            
+    # Select model with best loss on validation set
+    log_loss_val = np.array(log_loss_val)
+    mask = np.ravel(log_loss_val == min(log_loss_val))
+    label_best = list(itertools.compress(log_label, mask))[0]
+
+    return log_Y_hat_train, log_Y_hat_val, log_Y_hat_test, df, label_best
+
+# Usage example:
+"""
+# Example usage with special feature
+special_feature_train = np.array([0, 1, 0, 1, 2, 2, 1, 0])  # Discrete labels
+special_feature_val = np.array([0, 1, 2])
+special_feature_test = np.array([1, 0, 2, 1])
+
+# Run with MoE
+results_moe = grid_search_moe(MODEL_PATH,
+                             X_train, Y_train, special_feature_train,
+                             X_val, Y_val, special_feature_val,
+                             X_test, Y_test, special_feature_test,
+                             hyp, n_runs, varInput, 
+                             generate_s=True, use_moe=True)
+
+# Run without MoE (fallback to original)
+results_standard = grid_search_moe(MODEL_PATH,
+                                  X_train, Y_train, special_feature_train,
+                                  X_val, Y_val, special_feature_val,
+                                  X_test, Y_test, special_feature_test,
+                                  hyp, n_runs, varInput, 
+                                  generate_s=True, use_moe=False)
+
+# Or if no special feature exists
+results_no_feature = grid_search_moe(MODEL_PATH,
+                                    X_train, Y_train, None,  # No special feature
+                                    X_val, Y_val, None,
+                                    X_test, Y_test, None,
+                                    hyp, n_runs, varInput, 
+                                    generate_s=True, use_moe=True)  # Will fallback to standard
+"""
