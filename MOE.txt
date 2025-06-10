@@ -36,87 +36,109 @@ def create_expert_network(input_shape, output_shape, expert_id,
     expert.compile(optimizer=opt, loss="mean_squared_error")
     return expert
 
-def create_moe_model(input_shape, output_shape, num_experts, 
-                    activ, n_hl, n_ch, n_k, n_fc, dropout,
-                    seed=229, learning_rate=0.001, bias_constraint=True):
+def create_expert_ensemble(input_shape, output_shape, unique_labels,
+                          activ, n_hl, n_ch, n_k, n_fc, dropout,
+                          seed=229, learning_rate=0.001, bias_constraint=True):
     """
-    Create Mixture of Experts model with gating network
+    Create ensemble of expert networks (one per label)
     """
-    # Input layer
-    X_input = tf.keras.Input(shape=input_shape)
+    experts = {}
+    label_to_index = {label: i for i, label in enumerate(unique_labels)}
     
-    # Create multiple expert networks
-    expert_outputs = []
-    experts = []
-    
-    for i in range(num_experts):
+    for i, label in enumerate(unique_labels):
         expert = create_expert_network(input_shape, output_shape, i,
                                      activ, n_hl, n_ch, n_k, n_fc, dropout,
                                      seed, learning_rate, bias_constraint)
-        expert_output = expert(X_input)
-        expert_outputs.append(expert_output)
-        experts.append(expert)
+        experts[label] = expert
     
-    # Simple gating network (you might want to make this more sophisticated)
-    # For now, this creates a simple dense layer that outputs probabilities for each expert
-    gate_layer = tf.keras.layers.Flatten()(X_input)
-    gate_layer = tf.keras.layers.Dense(64, activation='relu')(gate_layer)
-    gate_probs = tf.keras.layers.Dense(num_experts, activation='softmax', name='gate')(gate_layer)
-    
-    # Combine expert outputs using gating probabilities
-    # Stack expert outputs: [batch_size, output_shape, num_experts]
-    stacked_outputs = tf.stack(expert_outputs, axis=-1)
-    
-    # Expand gate probabilities to match output dimensions
-    gate_probs_expanded = tf.expand_dims(gate_probs, axis=1)  # [batch_size, 1, num_experts]
-    
-    # Weighted combination of expert outputs
-    final_output = tf.reduce_sum(stacked_outputs * gate_probs_expanded, axis=-1)
-    
-    # Create the full MoE model
-    moe_model = tf.keras.Model(inputs=X_input, outputs=final_output, name='MoE_ConvNet')
-    
-    # Compilation
-    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, beta_1=0.9, beta_2=0.999, 
-                                  epsilon=None, decay=0.0, amsgrad=True)
-    moe_model.compile(optimizer=opt, loss="mean_squared_error")
-    
-    return moe_model, experts
+    return experts, label_to_index
 
 def train_expert_individually(expert, X_expert, Y_expert, X_val_expert, Y_val_expert,
-                            epochs, batch_size, expert_id, OUTFOLDER):
+                            epochs, batch_size, expert_label, OUTFOLDER):
     """
     Train individual expert on its subset of data
     """
-    print(f"Training Expert {expert_id}")
+    print(f"Training Expert for label {expert_label}")
+    
+    if len(X_expert) == 0:
+        print(f"No training data for expert {expert_label}, skipping...")
+        return None
     
     history = expert.fit(X_expert, Y_expert,
                         epochs=epochs,
                         batch_size=batch_size,
-                        validation_data=(X_val_expert, Y_val_expert),
+                        validation_data=(X_val_expert, Y_val_expert) if len(X_val_expert) > 0 else None,
                         verbose=1)
     
     # Plot and save history
     plt.figure(figsize=(8, 6))
     plt.plot(np.sqrt(history.history['loss']))
-    plt.plot(np.sqrt(history.history['val_loss']))
-    plt.title(f'Expert {expert_id} Loss')
+    if len(X_val_expert) > 0:
+        plt.plot(np.sqrt(history.history['val_loss']))
+        plt.legend(['train', 'val'], loc='upper left')
+    else:
+        plt.legend(['train'], loc='upper left')
+    plt.title(f'Expert {expert_label} Loss')
     plt.ylabel('loss')
     plt.xlabel('epoch')
-    plt.legend(['train', 'val'], loc='upper left')
-    plt.savefig(f'{OUTFOLDER}expert_{expert_id}_history.png')
+    plt.savefig(f'{OUTFOLDER}expert_{expert_label}_history.png')
     plt.close()
     
     return history
 
-def train_model_moe(OUTFOLDER, 
-                   X_train, Y_train, special_feature_train,
-                   X_val, Y_val, special_feature_val,
-                   X_test, Y_test, special_feature_test,
-                   config,
-                   label, generate_s, use_moe=True):
+def save_expert_ensemble(experts, label_to_index, OUTFOLDER, label):
     """
-    Train Mixture of Experts model or fallback to original ConvNet
+    Save all experts in the ensemble
+    """
+    # Save label mapping
+    import json
+    with open(f'{OUTFOLDER}label_mapping_{label}.json', 'w') as f:
+        # Convert numpy types to native Python types for JSON serialization
+        mapping = {str(k): int(v) for k, v in label_to_index.items()}
+        json.dump(mapping, f)
+    
+    # Save each expert
+    for expert_label, expert in experts.items():
+        expert_json = expert.to_json()
+        with open(f'{OUTFOLDER}expert_{expert_label}_model_{label}.json', "w") as json_file:
+            json_file.write(expert_json)
+        expert.save_weights(f'{OUTFOLDER}expert_{expert_label}_weights_{label}.h5')
+    
+    print(f"Saved {len(experts)} experts to disk")
+
+def load_expert_ensemble(unique_labels, OUTFOLDER, label):
+    """
+    Load all experts in the ensemble
+    """
+    import json
+    
+    # Load label mapping
+    with open(f'{OUTFOLDER}label_mapping_{label}.json', 'r') as f:
+        label_to_index = json.load(f)
+        # Convert back to original types
+        label_to_index = {int(k) if k.isdigit() else k: v for k, v in label_to_index.items()}
+    
+    # Load each expert
+    experts = {}
+    for expert_label in unique_labels:
+        with open(f'{OUTFOLDER}expert_{expert_label}_model_{label}.json', "r") as json_file:
+            loaded_model_json = json_file.read()
+        expert = tf.keras.models.model_from_json(loaded_model_json)
+        expert.load_weights(f'{OUTFOLDER}expert_{expert_label}_weights_{label}.h5')
+        expert.compile(optimizer='Adam', loss="mean_squared_error")
+        experts[expert_label] = expert
+    
+    print(f"Loaded {len(experts)} experts from disk")
+    return experts, label_to_index
+
+def train_model_expert_ensemble(OUTFOLDER, 
+                               X_train, Y_train, special_feature_train,
+                               X_val, Y_val, special_feature_val,
+                               X_test, Y_test, special_feature_test,
+                               config,
+                               label, generate_s, use_experts=True):
+    """
+    Train Expert Ensemble or fallback to original ConvNet
     """
     
     if generate_s:
@@ -131,22 +153,21 @@ def train_model_moe(OUTFOLDER,
         X_shape = X_train.shape[1:]
         output_shape = Y_train.shape[-1]
         
-        # Check if special feature exists and use_moe is True
-        if special_feature_train is not None and use_moe:
-            print("Training Mixture of Experts model")
+        # Check if special feature exists and use_experts is True
+        if special_feature_train is not None and use_experts:
+            print("Training Expert Ensemble")
             
             # Get unique labels in special feature
             unique_labels = np.unique(special_feature_train)
-            num_experts = len(unique_labels)
-            print(f"Number of experts: {num_experts}")
+            print(f"Number of experts: {len(unique_labels)}")
             print(f"Expert labels: {unique_labels}")
             
-            # Create MoE model
-            moe_model, experts = create_moe_model(X_shape, output_shape, num_experts,
-                                                 activ, n_hl, n_ch, n_k, n_fc, dropout, seed)
+            # Create expert ensemble
+            experts, label_to_index = create_expert_ensemble(X_shape, output_shape, unique_labels,
+                                                           activ, n_hl, n_ch, n_k, n_fc, dropout, seed)
             
             # Train each expert individually on its subset
-            for i, expert_label in enumerate(unique_labels):
+            for expert_label in unique_labels:
                 # Get data for this expert
                 train_mask = special_feature_train == expert_label
                 val_mask = special_feature_val == expert_label
@@ -156,26 +177,21 @@ def train_model_moe(OUTFOLDER,
                 X_val_expert = X_val[val_mask]
                 Y_val_expert = Y_val[val_mask]
                 
-                print(f"Expert {i} (label {expert_label}): {len(X_expert)} training samples, {len(X_val_expert)} validation samples")
+                print(f"Expert {expert_label}: {len(X_expert)} training samples, {len(X_val_expert)} validation samples")
                 
                 # Train individual expert
-                if len(X_expert) > 0:  # Only train if we have data
-                    train_expert_individually(experts[i], X_expert, Y_expert, 
-                                            X_val_expert, Y_val_expert,
-                                            epochs, batch_size, i, OUTFOLDER)
+                train_expert_individually(experts[expert_label], X_expert, Y_expert, 
+                                        X_val_expert, Y_val_expert,
+                                        epochs, batch_size, expert_label, OUTFOLDER)
             
-            # Now train the full MoE model (fine-tuning with gating)
-            print("Fine-tuning full MoE model with gating network")
-            history = moe_model.fit(X_train, Y_train,
-                                   epochs=epochs//2,  # Use fewer epochs for fine-tuning
-                                   batch_size=batch_size,
-                                   validation_data=(X_val, Y_val),
-                                   verbose=1)
+            # Save expert ensemble
+            save_expert_ensemble(experts, label_to_index, OUTFOLDER, label)
             
-            model = moe_model
+            # Use experts for predictions
+            model = experts  # Keep reference to experts
             
         else:
-            print("Training standard ConvNet (no special feature or MoE disabled)")
+            print("Training standard ConvNet (no special feature or experts disabled)")
             # Create standard supervised model (your original approach)
             model = create_supervised(X_shape, output_shape, 
                                     activ, n_hl, n_ch, n_fc, n_k, dropout, seed=seed)
@@ -186,62 +202,71 @@ def train_model_moe(OUTFOLDER,
                                batch_size=batch_size,
                                validation_data=(X_val, Y_val),
                                verbose=1)
-
-        # Report model summary
-        model.summary()
-        
-        # Plot history loss
-        plt.figure(figsize=(8, 6))
-        plt.plot(np.sqrt(history.history['loss']))
-        plt.plot(np.sqrt(history.history['val_loss']))
-        plt.title('Model Loss')
-        plt.ylabel('loss')
-        plt.xlabel('epoch')
-        plt.legend(['train', 'val'], loc='upper left')
-        plt.savefig(OUTFOLDER + 'history' + '_model_' + str(label) + '.png')
-        plt.close()
-
-        # Save model
-        model_json = model.to_json()
-        with open(OUTFOLDER + 'model_' + str(label) + '.json', "w") as json_file:
-            json_file.write(model_json)
-        model.save_weights(OUTFOLDER + 'model_' + str(label) + '.h5')
-        print("Saved model to disk")
+            
+            # Plot history loss
+            plt.figure(figsize=(8, 6))
+            plt.plot(np.sqrt(history.history['loss']))
+            plt.plot(np.sqrt(history.history['val_loss']))
+            plt.title('Model Loss')
+            plt.ylabel('loss')
+            plt.xlabel('epoch')
+            plt.legend(['train', 'val'], loc='upper left')
+            plt.savefig(OUTFOLDER + 'history' + '_model_' + str(label) + '.png')
+            plt.close()
+            
+            # Save standard model
+            model_json = model.to_json()
+            with open(OUTFOLDER + 'model_' + str(label) + '.json', "w") as json_file:
+                json_file.write(model_json)
+            model.save_weights(OUTFOLDER + 'model_' + str(label) + '.h5')
+            print("Saved standard model to disk")
 
     else:
         # Load model
-        with open(OUTFOLDER + 'model_' + str(label) + '.json', "r") as json_file:
-            loaded_model_json = json_file.read()
-        model = tf.keras.models.model_from_json(loaded_model_json)
-        model.load_weights(OUTFOLDER + 'model_' + str(label) + '.h5')
-        print("Loaded model from disk")
+        if special_feature_train is not None and use_experts:
+            # Load expert ensemble
+            unique_labels = np.unique(special_feature_train)
+            model, label_to_index = load_expert_ensemble(unique_labels, OUTFOLDER, label)
+        else:
+            # Load standard model
+            with open(OUTFOLDER + 'model_' + str(label) + '.json', "r") as json_file:
+                loaded_model_json = json_file.read()
+            model = tf.keras.models.model_from_json(loaded_model_json)
+            model.load_weights(OUTFOLDER + 'model_' + str(label) + '.h5')
+            model.compile(optimizer='Adam', loss="mean_squared_error")
+            print("Loaded standard model from disk")
 
-        # Report model summary
-        model.summary()
-
-        # Compilation
-        model.compile(optimizer='Adam', loss="mean_squared_error") 
-
-    # Evaluate model       
-    loss_Tr = model.evaluate(x=X_train, y=Y_train)
-    loss_Va = model.evaluate(x=X_val, y=Y_val)
-    loss_Ts = model.evaluate(x=X_test, y=Y_test)
-    
-    # Target predictions
-    y_hat_train = model.predict(x=X_train)
-    y_hat_val = model.predict(x=X_val)
-    y_hat_test = model.predict(x=X_test)
+    # Evaluate model
+    if isinstance(model, dict):  # Expert ensemble
+        loss_Tr = evaluate_experts(model, X_train, Y_train, special_feature_train)
+        loss_Va = evaluate_experts(model, X_val, Y_val, special_feature_val)
+        loss_Ts = evaluate_experts(model, X_test, Y_test, special_feature_test)
+        
+        # Target predictions
+        y_hat_train = predict_with_experts(model, X_train, special_feature_train)
+        y_hat_val = predict_with_experts(model, X_val, special_feature_val)
+        y_hat_test = predict_with_experts(model, X_test, special_feature_test)
+        
+    else:  # Standard model
+        loss_Tr = model.evaluate(x=X_train, y=Y_train)
+        loss_Va = model.evaluate(x=X_val, y=Y_val)
+        loss_Ts = model.evaluate(x=X_test, y=Y_test)
+        
+        # Target predictions
+        y_hat_train = model.predict(x=X_train)
+        y_hat_val = model.predict(x=X_val)
+        y_hat_test = model.predict(x=X_test)
     
     return loss_Tr, loss_Va, loss_Ts, y_hat_train, y_hat_val, y_hat_test
 
-def grid_search_moe(MODEL_PATH,
-                   X_train, Y_train, special_feature_train,
-                   X_val, Y_val, special_feature_val,
-                   X_test, Y_test, special_feature_test,
-                   hyp, n_runs, varInput, 
-                   generate_s=True, use_moe=True):
+def grid_search_expert_ensemble(MODEL_PATH,
+                               X_train, Y_train, special_feature_train,
+                               X_val, Y_val, special_feature_val,
+                               X_test, Y_test, special_feature_test,
+                               hyp, n_runs, varInput, 
+                               generate_s=True, use_experts=True):
     """
-    Grid search for MoE model
+    Grid search for Expert Ensemble
     """
     # Set-up
     log_Y_hat_train, log_Y_hat_val, log_Y_hat_test, log_loss_val, log_label = [], [], [], [], []
@@ -257,14 +282,100 @@ def grid_search_moe(MODEL_PATH,
         for jj in range(n_runs):                          # Check reproducibility - n runs                     
             
             # Simulation label
-            moe_suffix = "_moe" if use_moe and special_feature_train is not None else "_standard"
-            label = varInput + '_h_' + str(ii) + '_run_' + str(jj) + moe_suffix
+            expert_suffix = "_experts" if use_experts and special_feature_train is not None else "_standard"
+            label = varInput + '_h_' + str(ii) + '_run_' + str(jj) + expert_suffix
             print('')
             print('Simulation:', label)
 
-            # Train NN model
+            # Train model
             time_start = time.time()
             loss_Tr, loss_Va, loss_Ts,\
+            Y_hat_train, Y_hat_val, Y_hat_test = \
+            train_model_expert_ensemble(MODEL_PATH, 
+                                       X_train, Y_train, special_feature_train,
+                                       X_val, Y_val, special_feature_val,
+                                       X_test, Y_test, special_feature_test,
+                                       config,
+                                       label, generate_s=generate_s, use_experts=use_experts)
+
+            # Store results
+            log_Y_hat_train.append(Y_hat_train)
+            log_Y_hat_val.append(Y_hat_val)
+            log_Y_hat_test.append(Y_hat_test)
+            log_loss_val.append(loss_Va)
+            log_label.append(label)
+
+            # Compute evaluation metrics
+            df_k['run'] = jj
+            df_k['input'] = varInput
+            df_k['model_type'] = 'Expert_Ensemble' if use_experts and special_feature_train is not None else 'Standard'
+            df_k['RMSE-Ts'] = np.round(np.sqrt(np.mean((Y_hat_test - Y_test)**2)), 3)
+            df_k['RMSE-Tr'] = np.round(np.sqrt(np.mean((Y_hat_train - Y_train)**2)), 3)
+            df_k['RMSE-Va'] = np.round(np.sqrt(np.mean((Y_hat_val - Y_val)**2)), 3)
+            df_k['Time[min]'] = np.round((time.time()-time_start)/60, 2)            
+            df = df.append(df_k)
+            print('')
+            print(df.to_string())
+
+            # Write solutions to file
+            suffix = "_ExpertEnsemble" if use_experts and special_feature_train is not None else "_Standard"
+            df.to_csv(MODEL_PATH + 'Training_' + varInput + suffix + '.csv')
+            
+    # Select model with best loss on validation set
+    log_loss_val = np.array(log_loss_val)
+    mask = np.ravel(log_loss_val == min(log_loss_val))
+    label_best = list(itertools.compress(log_label, mask))[0]
+
+    return log_Y_hat_train, log_Y_hat_val, log_Y_hat_test, df, label_best
+
+# Convenience function for inference when you know the labels
+def predict_new_data(experts_or_model, X_new, special_feature_new=None):
+    """
+    Make predictions on new data. 
+    If experts dict is provided and special_feature_new is available, 
+    route to appropriate experts. Otherwise use standard model.
+    """
+    if isinstance(experts_or_model, dict) and special_feature_new is not None:
+        # Use expert ensemble
+        return predict_with_experts(experts_or_model, X_new, special_feature_new)
+    else:
+        # Use standard model
+        return experts_or_model.predict(X_new)
+
+# Usage example:
+"""
+# Example usage with known labels at inference time
+special_feature_train = np.array([0, 1, 0, 1, 2, 2, 1, 0])  # Discrete labels
+special_feature_val = np.array([0, 1, 2])
+special_feature_test = np.array([1, 0, 2, 1])
+
+# Train expert ensemble
+results_experts = grid_search_expert_ensemble(MODEL_PATH,
+                                             X_train, Y_train, special_feature_train,
+                                             X_val, Y_val, special_feature_val,
+                                             X_test, Y_test, special_feature_test,
+                                             hyp, n_runs, varInput, 
+                                             generate_s=True, use_experts=True)
+
+# For inference on new data with known labels:
+# Load the best expert ensemble
+best_label = results_experts[4]  # label_best
+unique_labels = np.unique(special_feature_train)
+experts, _ = load_expert_ensemble(unique_labels, MODEL_PATH, best_label)
+
+# New data with known labels
+X_new = np.random.random((10, *X_train.shape[1:]))
+special_feature_new = np.array([0, 1, 2, 0, 1, 2, 0, 1, 2, 0])  # Known labels
+
+# Direct prediction using appropriate experts
+predictions = predict_new_data(experts, X_new, special_feature_new)
+
+# Or predict for specific label only:
+label_of_interest = 1
+mask = special_feature_new == label_of_interest
+X_specific = X_new[mask]
+predictions_specific = experts[label_of_interest].predict(X_specific)
+"""_Va, loss_Ts,\
             Y_hat_train, Y_hat_val, Y_hat_test = \
             train_model_moe(MODEL_PATH, 
                            X_train, Y_train, special_feature_train,
